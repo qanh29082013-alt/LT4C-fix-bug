@@ -1,0 +1,10 @@
+node_modules/
+*.log
+quack_*.txt
+worker-tokens.json
+cloudflared
+cloudflared.exe
+worker.zip
+.env
+.env.*
+!.env.example
