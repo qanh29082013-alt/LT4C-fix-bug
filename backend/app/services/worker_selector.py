@@ -1,0 +1,119 @@
+from __future__ import annotations
+
+import random
+from typing import Optional, Sequence, Set
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from app.models import Worker, VpsSession, vps_product_workers
+
+ACTIVE_STATUSES = {"pending", "provisioning", "ready"}
+
+
+class WorkerSelector:
+    def __init__(self, db: Session) -> None:
+        self.db = db
+
+    def _active_session_counts(self, worker_ids: list) -> dict:
+        if not worker_ids:
+            return {}
+        stmt = (
+            select(VpsSession.worker_id, func.count(VpsSession.id))
+            .where(VpsSession.worker_id.in_(worker_ids))
+            .where(VpsSession.status.in_(ACTIVE_STATUSES))
+            .group_by(VpsSession.worker_id)
+        )
+        return {worker_id: count for worker_id, count in self.db.execute(stmt).all()}
+
+    def _filter_excluded(self, workers: Sequence[Worker], exclude: Optional[Set] = None) -> list[Worker]:
+        if not exclude:
+            return list(workers)
+        return [worker for worker in workers if worker.id not in exclude]
+
+    def get_all_workers_for_product(self, product_id, *, exclude: Optional[Set] = None) -> list[Worker]:
+        """Lấy tất cả worker cho một sản phẩm cụ thể."""
+        print(f"[DEBUG] WorkerSelector.get_all_workers_for_product called for product_id: {product_id}")
+        
+        stmt = (
+            select(Worker)
+            .join(vps_product_workers, Worker.id == vps_product_workers.c.worker_id)
+            .where(vps_product_workers.c.product_id == product_id)
+            .where(Worker.status == "active")
+            .order_by(Worker.created_at.desc())
+        )
+        workers = list(self.db.scalars(stmt))
+        print(f"[DEBUG] Found {len(workers)} workers directly assigned to product {product_id}")
+        for w in workers:
+            print(f"[DEBUG]   - Worker: {w.name} (ID: {w.id}, Status: {w.status})")
+        
+        workers = self._filter_excluded(workers, exclude)
+        print(f"[DEBUG] After filtering excluded workers: {len(workers)} workers remain")
+        
+        if not workers:
+            print(f"[DEBUG] No workers found for product {product_id}, using fallback to all active workers")
+            fallback_stmt = (
+                select(Worker)
+                .where(Worker.status == "active")
+                .order_by(Worker.created_at.desc())
+            )
+            fallback_workers = list(self.db.scalars(fallback_stmt))
+            print(f"[DEBUG] Fallback found {len(fallback_workers)} active workers")
+            for w in fallback_workers:
+                print(f"[DEBUG]   - Fallback Worker: {w.name} (ID: {w.id}, Status: {w.status})")
+            workers = self._filter_excluded(fallback_workers, exclude)
+            print(f"[DEBUG] After filtering excluded fallback workers: {len(workers)} workers remain")
+        
+        print(f"[DEBUG] Returning {len(workers)} workers for product {product_id}")
+        return workers
+
+    def select_for_product(self, product_id, *, exclude: Optional[Set] = None) -> Optional[Worker]:
+        stmt = (
+            select(Worker)
+            .join(vps_product_workers, Worker.id == vps_product_workers.c.worker_id)
+            .where(vps_product_workers.c.product_id == product_id)
+            .where(Worker.status == "active")
+            .order_by(Worker.created_at.desc())
+        )
+        workers = self._filter_excluded(list(self.db.scalars(stmt)), exclude)
+        if not workers:
+            fallback_stmt = (
+                select(Worker)
+                .where(Worker.status == "active")
+                .order_by(Worker.created_at.desc())
+            )
+            workers = self._filter_excluded(list(self.db.scalars(fallback_stmt)), exclude)
+            if not workers:
+                return None
+
+        counts = self._active_session_counts([worker.id for worker in workers])
+        candidates: list[tuple[Worker, int]] = []
+
+        for worker in workers:
+            active = counts.get(worker.id, 0)
+            max_sessions_raw = worker.max_sessions
+            max_sessions = (
+                float("inf")
+                if max_sessions_raw is None or max_sessions_raw <= 0
+                else max_sessions_raw
+            )
+            if active >= max_sessions:
+                continue
+            candidates.append((worker, active))
+
+        if not candidates:
+            # All workers appear at capacity; fall back to the least-loaded worker anyway.
+            least_loaded_worker = min(workers, key=lambda worker: counts.get(worker.id, 0))
+            return least_loaded_worker
+
+        min_active = min(active for _, active in candidates)
+        least_loaded = [worker for worker, active in candidates if active == min_active]
+        return random.choice(least_loaded)
+        
+    def get_worker_by_id(self, worker_id) -> Optional[Worker]:
+        """Get a worker by its ID."""
+        stmt = select(Worker).where(Worker.id == worker_id).where(Worker.status == "active")
+        return self.db.scalar(stmt)
+
+
+__all__ = ["WorkerSelector"]
